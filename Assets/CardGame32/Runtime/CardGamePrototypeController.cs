@@ -11,6 +11,14 @@ namespace CardGame32
 {
     public class CardGamePrototypeController : MonoBehaviour
     {
+        private enum RoundPhase
+        {
+            Betting,
+            Challenge,
+            Showdown,
+            RoundEnd
+        }
+
         [Header("Prototype")]
         [Range(4, 8)]
         public int playerCount = 6;
@@ -18,12 +26,16 @@ namespace CardGame32
         public int startingScore = 50;
         public int roomNumber = 102938;
 
-        private const string BackgroundResourcePath = "CardGame32/table-room-bg";
+        private const int LocalPlayerIndex = 0;
+        private const float TurnSeconds = 10f;
+        private const string BackgroundResourcePath = "CardGame32/table-room-bg-v2";
 
         private readonly List<PlayerState> players = new List<PlayerState>();
         private readonly List<CardDefinition> deck = new List<CardDefinition>();
         private readonly List<GameObject> dealtObjects = new List<GameObject>();
         private readonly List<Text> playerScoreTexts = new List<Text>();
+        private readonly List<Text> playerActionTexts = new List<Text>();
+        private readonly List<Image> playerTurnRings = new List<Image>();
         private readonly LocalLobbyMockService lobbyService = new LocalLobbyMockService();
 
         private readonly Color coral = new Color(0.91f, 0.27f, 0.20f);
@@ -44,9 +56,13 @@ namespace CardGame32
         private Text statusText;
         private Text roomText;
         private Text chatPreviewText;
-        private Text driveButtonText;
+        private Text actionHintText;
+        private Text actionTimerText;
         private Text microphoneButtonText;
-        private Image driveGlow;
+        private InputField chatInputField;
+        private Button foldButton;
+        private Button raiseButton;
+        private Button knockButton;
         private Transform backgroundRoot;
         private Transform tableOverlayRoot;
         private Transform cardRoot;
@@ -61,14 +77,20 @@ namespace CardGame32
         private Sprite circleSprite;
         private Sprite cardSprite;
         private Sprite loadedBackgroundSprite;
+        private RoundPhase phase;
         private int pot;
-        private int dealerIndex;
+        private int currentTurnIndex;
+        private int firstActorIndex;
+        private int challengeLeaderIndex = -1;
+        private int challengeCallerIndex = -1;
         private int roundNumber;
-        private float drivePulse;
-        private bool driving;
+        private float turnTimeRemaining;
+        private float aiThinkRemaining;
+        private string statusMessage = string.Empty;
         private bool built;
-        private bool microphoneMuted = true;
+        private bool microphoneMuted;
         private bool voiceJoinInProgress;
+        private bool roundTransitionInProgress;
 
         private void Awake()
         {
@@ -101,16 +123,34 @@ namespace CardGame32
 
         private void Update()
         {
-            if (driveGlow == null)
+            if (phase != RoundPhase.Betting && phase != RoundPhase.Challenge)
             {
                 return;
             }
 
-            drivePulse += Time.deltaTime * 5.5f;
-            float alpha = driving ? 0.88f : 0.58f + Mathf.Sin(drivePulse) * 0.22f;
-            Color color = driveGlow.color;
-            color.a = Mathf.Clamp01(alpha);
-            driveGlow.color = color;
+            if (roundTransitionInProgress || currentTurnIndex < 0 || currentTurnIndex >= players.Count)
+            {
+                return;
+            }
+
+            turnTimeRemaining -= Time.deltaTime;
+            if (turnTimeRemaining <= 0f)
+            {
+                PlayerFold(currentTurnIndex, true);
+                return;
+            }
+
+            if (currentTurnIndex != LocalPlayerIndex)
+            {
+                aiThinkRemaining -= Time.deltaTime;
+                if (aiThinkRemaining <= 0f)
+                {
+                    PerformAiAction(currentTurnIndex);
+                    return;
+                }
+            }
+
+            UpdateActionControls();
         }
 
         public void StartNewMatch()
@@ -158,12 +198,12 @@ namespace CardGame32
                 players.Add(new PlayerState
                 {
                     Name = names[i],
-                    Score = startingScore,
-                    Folded = false
+                    Score = startingScore
                 });
             }
 
-            dealerIndex = Random.Range(0, playerCount);
+            microphoneMuted = false;
+            TryJoinVivoxRoomVoice();
             pot = 0;
             roundNumber = 0;
             RefillPotIfNeeded();
@@ -173,8 +213,11 @@ namespace CardGame32
 
         public void DealRound()
         {
+            StopAllCoroutines();
+            roundTransitionInProgress = false;
             roundNumber++;
-            ClearDealtObjects();
+            challengeLeaderIndex = -1;
+            challengeCallerIndex = -1;
             deck.Clear();
             deck.AddRange(CardGameRules.CreateShuffledDeck());
 
@@ -182,6 +225,9 @@ namespace CardGame32
             {
                 player.Cards.Clear();
                 player.Folded = false;
+                player.Revealed = false;
+                player.HasActed = false;
+                player.LastAction = string.Empty;
             }
 
             for (int cardIndex = 0; cardIndex < 2; cardIndex++)
@@ -193,52 +239,59 @@ namespace CardGame32
             }
 
             RefillPotIfNeeded();
+            firstActorIndex = Random.Range(0, playerCount);
+            phase = RoundPhase.Betting;
+            statusMessage = "\u7b2c " + roundNumber + " \u5c40\uff0c" + players[firstActorIndex].Name + " \u5148\u8bf4\u8bdd";
             RenderHands();
-            RefreshUi("\u7b2c " + roundNumber + " \u5c40\uff0c" + players[dealerIndex].Name + " \u5148\u8bf4\u8bdd");
+            StartTurn(firstActorIndex);
         }
 
         public void Fold()
         {
-            players[0].Folded = true;
-            RefreshUi("\u4f60\u9009\u62e9\u5f03\u724c\uff0c\u7b49\u5f85\u4e0b\u4e00\u5c40");
+            if (!CanLocalAct())
+            {
+                return;
+            }
+
+            PlayerFold(LocalPlayerIndex, false);
         }
 
         public void Raise()
         {
-            if (players[0].Score <= 0)
+            if (!CanLocalAct() || phase != RoundPhase.Betting)
             {
-                RefreshUi("\u5e95\u724c\u4e0d\u591f\uff0c\u4e0d\u80fd\u52a0\u6ce8");
                 return;
             }
 
-            players[0].Score -= 1;
-            pot += 1;
-            RefreshUi("\u4f60\u52a0\u6ce8 1 \u5f20\u5e95\u724c");
+            PlayerRaise(LocalPlayerIndex);
         }
 
         public void Knock()
         {
-            ResolveAgainstBestOpponent("\u4f60\u6572\u684c");
-        }
-
-        public void Drive()
-        {
-            if (!driving)
-            {
-                StartCoroutine(DriveRoutine());
-            }
-        }
-
-        public void SendQuickChat()
-        {
-            if (currentRoom == null || localAccount == null)
+            if (!CanLocalAct())
             {
                 return;
             }
 
-            lobbyService.SendTextMessage(currentRoom.Settings.RoomCode, localAccount, "\u6211\u51c6\u5907\u597d\u4e86");
+            PlayerKnock(LocalPlayerIndex);
+        }
+
+        public void SendChatFromInput()
+        {
+            if (currentRoom == null || localAccount == null || chatInputField == null)
+            {
+                return;
+            }
+
+            string text = chatInputField.text.Trim();
+            if (string.IsNullOrEmpty(text))
+            {
+                return;
+            }
+
+            lobbyService.SendTextMessage(currentRoom.Settings.RoomCode, localAccount, text);
+            chatInputField.text = string.Empty;
             UpdateChatPreview();
-            RefreshUi("\u53d1\u9001\u4e86\u4e00\u6761\u623f\u95f4\u6587\u5b57\u804a\u5929");
         }
 
         public void ToggleMicrophone()
@@ -254,23 +307,28 @@ namespace CardGame32
                 microphoneButtonText.text = microphoneMuted ? "\u9ea6\u5173" : "\u9ea6\u5f00";
             }
 
-            if (vivoxVoiceClient != null)
+            if (vivoxVoiceClient == null)
             {
-                if (microphoneMuted)
-                {
-                    vivoxVoiceClient.SetMicrophoneMuted(true);
-                }
-                else
-                {
-                    TryJoinVivoxRoomVoice();
-                }
+                return;
             }
 
-            RefreshUi(microphoneMuted ? "\u5df2\u5173\u95ed\u9ea6\u514b\u98ce" : "\u5df2\u6253\u5f00\u9ea6\u514b\u98ce\uff0c\u6b63\u5728\u8fde\u63a5 Vivox \u623f\u95f4\u8bed\u97f3");
+            if (microphoneMuted)
+            {
+                vivoxVoiceClient.SetMicrophoneMuted(true);
+            }
+            else
+            {
+                TryJoinVivoxRoomVoice();
+            }
         }
 
         private async void TryJoinVivoxRoomVoice()
         {
+            if (!Application.isPlaying)
+            {
+                return;
+            }
+
             if (voiceJoinInProgress || currentRoom == null || localAccount == null || vivoxVoiceClient == null)
             {
                 return;
@@ -281,12 +339,10 @@ namespace CardGame32
             {
                 await vivoxVoiceClient.JoinRoomVoiceAsync(currentRoom.Settings.RoomCode, localAccount.DisplayName);
                 vivoxVoiceClient.SetMicrophoneMuted(microphoneMuted);
-                RefreshUi("Vivox \u623f\u95f4\u8bed\u97f3\u5df2\u8fde\u63a5");
             }
             catch (System.Exception exception)
             {
                 Debug.LogWarning("Vivox voice join failed: " + exception.Message);
-                RefreshUi("Vivox \u5305\u5df2\u5b89\u88c5\uff0cUnity Dashboard \u542f\u7528\u540e\u53ef\u8fde\u63a5\u8bed\u97f3");
             }
             finally
             {
@@ -294,84 +350,313 @@ namespace CardGame32
             }
         }
 
-        private IEnumerator DriveRoutine()
+        private bool CanLocalAct()
         {
-            driving = true;
-            float timer = 2.0f;
-
-            while (timer > 0)
+            if (currentTurnIndex != LocalPlayerIndex || roundTransitionInProgress)
             {
-                if (driveButtonText != null)
-                {
-                    driveButtonText.text = "\u5f00\u8f66\n" + Mathf.CeilToInt(timer) + "s";
-                }
-
-                timer -= Time.deltaTime;
-                yield return null;
+                return false;
             }
 
-            if (players[0].Score >= pot)
+            if (phase != RoundPhase.Betting && phase != RoundPhase.Challenge)
             {
-                players[0].Score -= pot;
-                pot += pot;
+                return false;
+            }
+
+            return !players[LocalPlayerIndex].Folded;
+        }
+
+        private void StartTurn(int playerIndex)
+        {
+            currentTurnIndex = playerIndex;
+            turnTimeRemaining = TurnSeconds;
+            aiThinkRemaining = playerIndex == LocalPlayerIndex ? 0f : Random.Range(0.85f, 2.15f);
+
+            if (phase == RoundPhase.Betting)
+            {
+                statusMessage = players[playerIndex].Name + " \u884c\u52a8\u4e2d\uff1a\u5f03\u724c / \u52a0\u6ce8 / \u6572\u684c";
             }
             else
             {
-                pot += players[0].Score;
-                players[0].Score = 0;
+                string leaderName = challengeLeaderIndex >= 0 ? players[challengeLeaderIndex].Name : "\u5bf9\u624b";
+                statusMessage = leaderName + " \u5df2\u6572\u684c\uff0c" + players[playerIndex].Name + " \u9009\u62e9\u6572\u684c\u6216\u5f03\u724c";
             }
 
-            dealerIndex = 0;
-            driving = false;
-            if (driveButtonText != null)
-            {
-                driveButtonText.text = "\u5f00\u8f66\n2s";
-            }
-
-            DealRound();
-            RefreshUi("\u4f60\u5f00\u8f66\u5e76\u6210\u4e3a\u672c\u5c40\u5148\u624b");
+            RefreshUi();
+            UpdateActionControls();
         }
 
-        private void ResolveAgainstBestOpponent(string action)
+        private void PerformAiAction(int playerIndex)
         {
-            if (players[0].Cards.Count < 2)
+            if (playerIndex < 0 || playerIndex >= players.Count || players[playerIndex].Folded)
+            {
+                AdvanceAfterFoldOrAction(playerIndex);
+                return;
+            }
+
+            HandEvaluation evaluation = CardGameRules.Evaluate(players[playerIndex].Cards[0], players[playerIndex].Cards[1]);
+            int strength = (int)evaluation.Category;
+            float roll = Random.value;
+
+            if (phase == RoundPhase.Challenge)
+            {
+                if (strength >= (int)HandCategory.Special28 || roll > 0.58f)
+                {
+                    PlayerKnock(playerIndex);
+                }
+                else
+                {
+                    PlayerFold(playerIndex, false);
+                }
+
+                return;
+            }
+
+            if (strength >= (int)HandCategory.SpecialQ8 || roll > 0.84f)
+            {
+                PlayerKnock(playerIndex);
+            }
+            else if (players[playerIndex].Score > 0 && roll > 0.22f)
+            {
+                PlayerRaise(playerIndex);
+            }
+            else
+            {
+                PlayerFold(playerIndex, false);
+            }
+        }
+
+        private void PlayerFold(int playerIndex, bool timedOut)
+        {
+            PlayerState player = players[playerIndex];
+            player.Folded = true;
+            player.Revealed = false;
+            player.HasActed = true;
+            player.LastAction = timedOut ? "\u8d85\u65f6\u5f03\u724c" : "\u5f03\u724c";
+            statusMessage = player.Name + (timedOut ? " 10\u79d2\u672a\u9009\uff0c\u81ea\u52a8\u5f03\u724c" : " \u5f03\u724c");
+
+            RenderHands();
+
+            if (ActivePlayerCount() <= 1)
+            {
+                SettleSingleWinner();
+                return;
+            }
+
+            AdvanceAfterFoldOrAction(playerIndex);
+        }
+
+        private void PlayerRaise(int playerIndex)
+        {
+            PlayerState player = players[playerIndex];
+            if (player.Score > 0)
+            {
+                player.Score -= 1;
+                pot += 1;
+            }
+
+            player.HasActed = true;
+            player.LastAction = "\u52a0\u6ce8";
+            statusMessage = player.Name + " \u52a0\u6ce8 1 \u5f20\u5e95\u724c";
+            RenderHands();
+            AdvanceAfterFoldOrAction(playerIndex);
+        }
+
+        private void PlayerKnock(int playerIndex)
+        {
+            PlayerState player = players[playerIndex];
+            player.HasActed = true;
+            player.LastAction = phase == RoundPhase.Challenge ? "\u8ddf\u6572" : "\u6572\u684c";
+
+            if (phase == RoundPhase.Challenge)
+            {
+                challengeCallerIndex = playerIndex;
+                StartShowdown(challengeLeaderIndex, challengeCallerIndex);
+                return;
+            }
+
+            challengeLeaderIndex = playerIndex;
+            phase = RoundPhase.Challenge;
+            statusMessage = player.Name + " \u6572\u684c\uff0c\u5269\u4f59\u73a9\u5bb6\u53ef\u6572\u684c\u6216\u5f03\u724c";
+            RenderHands();
+            StartNextChallengeTurn(playerIndex);
+        }
+
+        private void AdvanceAfterFoldOrAction(int playerIndex)
+        {
+            if (roundTransitionInProgress)
             {
                 return;
             }
 
-            HandEvaluation mine = CardGameRules.Evaluate(players[0].Cards[0], players[0].Cards[1]);
-            int winner = 0;
-            HandEvaluation best = mine;
-
-            for (int i = 1; i < players.Count; i++)
+            if (phase == RoundPhase.Challenge)
             {
-                HandEvaluation candidate = CardGameRules.Evaluate(players[i].Cards[0], players[i].Cards[1]);
-                if (candidate.CompareTo(best) > 0)
+                StartNextChallengeTurn(playerIndex);
+                return;
+            }
+
+            int next = FindNextBettingPlayer(playerIndex);
+            if (next >= 0)
+            {
+                StartTurn(next);
+                return;
+            }
+
+            BeginChallengeAfterBetting();
+        }
+
+        private void BeginChallengeAfterBetting()
+        {
+            if (ActivePlayerCount() <= 1)
+            {
+                SettleSingleWinner();
+                return;
+            }
+
+            challengeLeaderIndex = FindNextActivePlayer(firstActorIndex - 1, true);
+            if (challengeLeaderIndex < 0)
+            {
+                SettleSingleWinner();
+                return;
+            }
+
+            players[challengeLeaderIndex].LastAction = "\u7b49\u5f85\u5bf9\u624b";
+            phase = RoundPhase.Challenge;
+            statusMessage = "\u52a0\u6ce8\u8f6e\u7ed3\u675f\uff0c" + players[challengeLeaderIndex].Name + " \u7b49\u5f85\u5bf9\u624b\u6572\u684c";
+            RenderHands();
+            StartNextChallengeTurn(challengeLeaderIndex);
+        }
+
+        private void StartNextChallengeTurn(int afterIndex)
+        {
+            if (ActivePlayerCount() <= 1)
+            {
+                SettleSingleWinner();
+                return;
+            }
+
+            int next = FindNextChallengePlayer(afterIndex);
+            if (next >= 0)
+            {
+                StartTurn(next);
+                return;
+            }
+
+            SettleSingleWinner();
+        }
+
+        private void StartShowdown(int firstIndex, int secondIndex)
+        {
+            if (firstIndex < 0 || secondIndex < 0)
+            {
+                SettleSingleWinner();
+                return;
+            }
+
+            roundTransitionInProgress = true;
+            phase = RoundPhase.Showdown;
+            currentTurnIndex = -1;
+            players[firstIndex].Revealed = true;
+            players[secondIndex].Revealed = true;
+
+            HandEvaluation first = CardGameRules.Evaluate(players[firstIndex].Cards[0], players[firstIndex].Cards[1]);
+            HandEvaluation second = CardGameRules.Evaluate(players[secondIndex].Cards[0], players[secondIndex].Cards[1]);
+            int winnerIndex = first.CompareTo(second) >= 0 ? firstIndex : secondIndex;
+            int loserIndex = winnerIndex == firstIndex ? secondIndex : firstIndex;
+            int sideLoss = Mathf.Min(players[loserIndex].Score, Mathf.Max(1, pot));
+
+            players[loserIndex].Score -= sideLoss;
+            players[winnerIndex].Score += pot + sideLoss;
+            statusMessage = players[firstIndex].Name + " \u548c " + players[secondIndex].Name + " \u4eae\u724c\uff0c" + players[winnerIndex].Name + " \u8d62\u5f97\u5956\u6c60";
+            pot = 0;
+            RenderHands();
+            RefreshUi();
+            UpdateActionControls();
+            StartCoroutine(NextRoundAfterDelay(3.2f));
+        }
+
+        private void SettleSingleWinner()
+        {
+            int winnerIndex = FindNextActivePlayer(-1, true);
+            if (winnerIndex < 0)
+            {
+                DealRound();
+                return;
+            }
+
+            roundTransitionInProgress = true;
+            phase = RoundPhase.RoundEnd;
+            currentTurnIndex = -1;
+            players[winnerIndex].Score += pot;
+            statusMessage = players[winnerIndex].Name + " \u7559\u5728\u724c\u5c40\u4e2d\uff0c\u62ff\u8d70\u5956\u6c60";
+            pot = 0;
+            RenderHands();
+            RefreshUi();
+            UpdateActionControls();
+            StartCoroutine(NextRoundAfterDelay(2.2f));
+        }
+
+        private IEnumerator NextRoundAfterDelay(float delay)
+        {
+            yield return new WaitForSeconds(delay);
+            ClearDealtObjects();
+            RefillPotIfNeeded();
+            DealRound();
+        }
+
+        private int FindNextBettingPlayer(int afterIndex)
+        {
+            for (int offset = 1; offset <= players.Count; offset++)
+            {
+                int index = (afterIndex + offset + players.Count) % players.Count;
+                if (!players[index].Folded && !players[index].HasActed)
                 {
-                    best = candidate;
-                    winner = i;
+                    return index;
                 }
             }
 
-            string result;
-            if (winner == 0)
+            return -1;
+        }
+
+        private int FindNextChallengePlayer(int afterIndex)
+        {
+            for (int offset = 1; offset <= players.Count; offset++)
             {
-                players[0].Score += pot;
-                result = action + "\u6210\u529f\uff0c\u8d62\u5f97\u5956\u6c60 " + pot;
-                pot = 0;
-            }
-            else
-            {
-                int loss = Mathf.Min(players[0].Score, Mathf.Max(1, pot));
-                players[0].Score -= loss;
-                players[winner].Score += pot + loss;
-                result = action + "\u5931\u8d25\uff0c" + players[winner].Name + " \u66f4\u5927\uff1a" + best.Label;
-                pot = 0;
+                int index = (afterIndex + offset + players.Count) % players.Count;
+                if (index != challengeLeaderIndex && !players[index].Folded)
+                {
+                    return index;
+                }
             }
 
-            RefillPotIfNeeded();
-            DealRound();
-            RefreshUi(result + "\uff0c\u5df2\u8fdb\u5165\u4e0b\u4e00\u5c40");
+            return -1;
+        }
+
+        private int FindNextActivePlayer(int afterIndex, bool includeAll)
+        {
+            for (int offset = 1; offset <= players.Count; offset++)
+            {
+                int index = (afterIndex + offset + players.Count) % players.Count;
+                if (!players[index].Folded && (includeAll || index != challengeLeaderIndex))
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        private int ActivePlayerCount()
+        {
+            int count = 0;
+            for (int i = 0; i < players.Count; i++)
+            {
+                if (!players[i].Folded)
+                {
+                    count++;
+                }
+            }
+
+            return count;
         }
 
         private void DrawCard(PlayerState player)
@@ -559,13 +844,13 @@ namespace CardGame32
                 CreateFallbackRoom();
             }
 
-            Image topShade = CreatePanel("Top Readability Shade", backgroundRoot, new Color(0f, 0f, 0f, 0.22f));
+            Image topShade = CreatePanel("Top Readability Shade", backgroundRoot, new Color(0f, 0f, 0f, 0.20f));
             topShade.sprite = null;
             SetAnchors(topShade.rectTransform, 0f, 0.76f, 1f, 1f);
 
-            Image bottomShade = CreatePanel("Bottom Readability Shade", backgroundRoot, new Color(0f, 0f, 0f, 0.28f));
+            Image bottomShade = CreatePanel("Bottom Readability Shade", backgroundRoot, new Color(0f, 0f, 0f, 0.34f));
             bottomShade.sprite = null;
-            SetAnchors(bottomShade.rectTransform, 0f, 0f, 1f, 0.22f);
+            SetAnchors(bottomShade.rectTransform, 0f, 0f, 1f, 0.24f);
         }
 
         private void CreateFallbackRoom()
@@ -580,60 +865,90 @@ namespace CardGame32
 
         private void CreateTableOverlay()
         {
-            Image centerGlow = CreateCircle("Center Prize Glow", tableOverlayRoot, new Color(1f, 0.84f, 0.34f, 0.12f));
-            SetRect(centerGlow.rectTransform, new Vector2(0.5f, 0.49f), new Vector2(190f, 190f), Vector2.zero);
+            Image centerGlow = CreateCircle("Center Prize Glow", tableOverlayRoot, new Color(1f, 0.82f, 0.34f, 0.10f));
+            SetRect(centerGlow.rectTransform, new Vector2(0.5f, 0.50f), new Vector2(170f, 170f), Vector2.zero);
 
-            Image cardSpot = CreatePanel("Local Card Spot", tableOverlayRoot, new Color(1f, 1f, 1f, 0.18f));
+            Image cardSpot = CreatePanel("Local Card Spot", tableOverlayRoot, new Color(1f, 1f, 1f, 0.12f));
             cardSpot.sprite = softRoundedSprite;
-            SetRect(cardSpot.rectTransform, new Vector2(0.5f, 0.334f), new Vector2(148f, 96f), Vector2.zero);
+            SetRect(cardSpot.rectTransform, new Vector2(0.5f, 0.335f), new Vector2(140f, 88f), Vector2.zero);
         }
 
         private void CreateTopBar()
         {
-            Image left = CreateFramedPanel("Room Panel", hudRoot, panelDark, new Vector2(0.04f, 0.953f), new Vector2(0.315f, 0.993f), 3f);
-            roomText = CreateText("Room Text", left.transform, string.Empty, 16, cream, TextAnchor.MiddleCenter);
+            Image left = CreateFramedPanel("Room Panel", hudRoot, panelDark, new Vector2(0.04f, 0.955f), new Vector2(0.315f, 0.993f), 3f);
+            roomText = CreateText("Room Text", left.transform, string.Empty, 15, cream, TextAnchor.MiddleCenter);
             Stretch(roomText.rectTransform, 7f, 0f, -7f, 0f);
 
-            Image right = CreateFramedPanel("Connection Panel", hudRoot, panelDark, new Vector2(0.705f, 0.953f), new Vector2(0.96f, 0.993f), 3f);
-            Text connection = CreateText("Connection Text", right.transform, "Wi-Fi  20:30", 15, cream, TextAnchor.MiddleCenter);
+            Image right = CreateFramedPanel("Connection Panel", hudRoot, panelDark, new Vector2(0.705f, 0.955f), new Vector2(0.96f, 0.993f), 3f);
+            Text connection = CreateText("Connection Text", right.transform, "Wi-Fi  20:30", 14, cream, TextAnchor.MiddleCenter);
             Stretch(connection.rectTransform, 6f, 0f, -6f, 0f);
         }
 
         private void CreatePotBadge()
         {
-            Image panel = CreateFramedPanel("Prize Pool Badge", hudRoot, panelRed, new Vector2(0.315f, 0.862f), new Vector2(0.685f, 0.965f), 5f);
+            Image panel = CreateFramedPanel("Prize Pool Badge", hudRoot, panelRed, new Vector2(0.325f, 0.868f), new Vector2(0.675f, 0.963f), 5f);
             panel.sprite = softRoundedSprite;
 
-            Text label = CreateText("Prize Pool Label", panel.transform, "\u5956\u6c60", 20, Color.white, TextAnchor.MiddleCenter);
+            Text label = CreateText("Prize Pool Label", panel.transform, "\u5956\u6c60", 18, Color.white, TextAnchor.MiddleCenter);
             label.fontStyle = FontStyle.Bold;
-            SetAnchors(label.rectTransform, 0f, 0.64f, 1f, 0.96f);
+            SetAnchors(label.rectTransform, 0f, 0.62f, 1f, 0.96f);
 
-            potText = CreateText("Prize Pool Amount", panel.transform, string.Empty, 39, yellow, TextAnchor.MiddleCenter);
+            potText = CreateText("Prize Pool Amount", panel.transform, string.Empty, 36, yellow, TextAnchor.MiddleCenter);
             potText.fontStyle = FontStyle.Bold;
-            SetAnchors(potText.rectTransform, 0f, 0.13f, 1f, 0.70f);
-
-            Image coin = CreateCircle("Prize Coin", panel.transform, gold);
-            SetRect(coin.rectTransform, new Vector2(0.5f, 0f), new Vector2(32f, 32f), new Vector2(0f, -7f));
-            Text coinText = CreateText("Prize Coin Text", coin.transform, "\u5956", 19, panelRed, TextAnchor.MiddleCenter);
-            coinText.fontStyle = FontStyle.Bold;
-            Stretch(coinText.rectTransform, 0f, 0f, 0f, 0f);
+            SetAnchors(potText.rectTransform, 0f, 0.12f, 1f, 0.70f);
         }
 
         private void CreateSocialBar()
         {
-            Image panel = CreateFramedPanel("Social Bar", hudRoot, new Color(0.07f, 0.07f, 0.10f, 0.92f), new Vector2(0.05f, 0.785f), new Vector2(0.95f, 0.842f), 3f);
+            Image panel = CreateFramedPanel("Social Bar", hudRoot, new Color(0.07f, 0.07f, 0.10f, 0.92f), new Vector2(0.05f, 0.785f), new Vector2(0.95f, 0.846f), 3f);
 
-            chatPreviewText = CreateText("Chat Preview", panel.transform, "\u804a\u5929\uff1a\u6b22\u8fce\u6765\u5230\u623f\u95f4", 14, cream, TextAnchor.MiddleLeft);
-            SetAnchors(chatPreviewText.rectTransform, 0.04f, 0.12f, 0.56f, 0.88f);
+            chatPreviewText = CreateText("Chat Preview", panel.transform, "\u804a\u5929\uff1a\u6b22\u8fce\u6765\u5230\u623f\u95f4", 13, cream, TextAnchor.MiddleLeft);
+            SetAnchors(chatPreviewText.rectTransform, 0.035f, 0.54f, 0.56f, 0.94f);
 
-            CreateButton("Quick Chat Button", panel.transform, "\u6253\u5b57", green, new Vector2(0.60f, 0.16f), new Vector2(0.76f, 0.84f), SendQuickChat, false, 17);
-            Button microphoneButton = CreateButton("Microphone Button", panel.transform, "\u9ea6\u5173", blue, new Vector2(0.79f, 0.16f), new Vector2(0.96f, 0.84f), ToggleMicrophone, false, 17);
+            chatInputField = CreateInputField("Chat Input", panel.transform, new Vector2(0.035f, 0.08f), new Vector2(0.59f, 0.50f));
+            CreateButton("Send Chat Button", panel.transform, "\u53d1\u9001", green, new Vector2(0.61f, 0.13f), new Vector2(0.76f, 0.86f), SendChatFromInput, false, 15);
+            Button microphoneButton = CreateButton("Microphone Button", panel.transform, "\u9ea6\u5f00", blue, new Vector2(0.79f, 0.13f), new Vector2(0.96f, 0.86f), ToggleMicrophone, false, 15);
             microphoneButtonText = microphoneButton.GetComponentInChildren<Text>();
+        }
+
+        private InputField CreateInputField(string objectName, Transform parent, Vector2 anchorMin, Vector2 anchorMax)
+        {
+            Image background = CreatePanel(objectName, parent, new Color(1f, 0.96f, 0.82f, 0.94f));
+            SetAnchors(background.rectTransform, anchorMin.x, anchorMin.y, anchorMax.x, anchorMax.y);
+
+            GameObject textObject = new GameObject("Text", typeof(RectTransform), typeof(CanvasRenderer), typeof(Text));
+            textObject.transform.SetParent(background.transform, false);
+            Text text = textObject.GetComponent<Text>();
+            text.font = uiFont;
+            text.fontSize = 13;
+            text.color = navy;
+            text.alignment = TextAnchor.MiddleLeft;
+            text.horizontalOverflow = HorizontalWrapMode.Wrap;
+            Stretch(text.rectTransform, 8f, 0f, -8f, 0f);
+
+            GameObject placeholderObject = new GameObject("Placeholder", typeof(RectTransform), typeof(CanvasRenderer), typeof(Text));
+            placeholderObject.transform.SetParent(background.transform, false);
+            Text placeholder = placeholderObject.GetComponent<Text>();
+            placeholder.font = uiFont;
+            placeholder.fontSize = 13;
+            placeholder.color = new Color(0.28f, 0.24f, 0.18f, 0.55f);
+            placeholder.alignment = TextAnchor.MiddleLeft;
+            placeholder.text = "\u8f93\u5165\u804a\u5929";
+            Stretch(placeholder.rectTransform, 8f, 0f, -8f, 0f);
+
+            InputField input = background.gameObject.AddComponent<InputField>();
+            input.textComponent = text;
+            input.placeholder = placeholder;
+            input.characterLimit = 40;
+            input.lineType = InputField.LineType.SingleLine;
+            return input;
         }
 
         private void CreatePlayerBadges()
         {
             playerScoreTexts.Clear();
+            playerActionTexts.Clear();
+            playerTurnRings.Clear();
             string[] names =
             {
                 "\u6211\u81ea\u5df1",
@@ -648,14 +963,14 @@ namespace CardGame32
 
             Vector2[] anchors =
             {
-                new Vector2(0.50f, 0.215f),
-                new Vector2(0.15f, 0.585f),
-                new Vector2(0.50f, 0.710f),
-                new Vector2(0.85f, 0.585f),
-                new Vector2(0.82f, 0.365f),
-                new Vector2(0.18f, 0.365f),
-                new Vector2(0.30f, 0.690f),
-                new Vector2(0.70f, 0.690f)
+                new Vector2(0.50f, 0.205f),
+                new Vector2(0.155f, 0.570f),
+                new Vector2(0.50f, 0.700f),
+                new Vector2(0.845f, 0.570f),
+                new Vector2(0.815f, 0.360f),
+                new Vector2(0.185f, 0.360f),
+                new Vector2(0.305f, 0.675f),
+                new Vector2(0.695f, 0.675f)
             };
 
             Color[] avatarColors =
@@ -677,7 +992,7 @@ namespace CardGame32
                 rect.anchorMin = anchors[i];
                 rect.anchorMax = anchors[i];
                 rect.pivot = new Vector2(0.5f, 0.5f);
-                rect.sizeDelta = new Vector2(i == 0 ? 136f : 124f, i == 0 ? 112f : 104f);
+                rect.sizeDelta = new Vector2(i == 0 ? 112f : 104f, i == 0 ? 92f : 86f);
                 rect.anchoredPosition = Vector2.zero;
             }
         }
@@ -687,18 +1002,26 @@ namespace CardGame32
             GameObject root = new GameObject(objectName, typeof(RectTransform));
             root.transform.SetParent(playerRoot, false);
 
+            Image turnRing = CreateCircle("Turn Ring", root.transform, new Color(1f, 0.88f, 0.30f, 0f));
+            SetAnchors(turnRing.rectTransform, 0.19f, 0.37f, 0.81f, 1.02f);
+            playerTurnRings.Add(turnRing);
+
             CreateCuteAvatar(root.transform, avatarColor, isSelf, styleIndex);
 
             Image labelPanel = CreateFramedPanel("Name Plate", root.transform, new Color(0.12f, 0.08f, 0.05f, 0.93f), new Vector2(0f, 0f), new Vector2(1f, 0.48f), 2f);
 
-            Text name = CreateText("Name", labelPanel.transform, playerName, isSelf ? 17 : 15, Color.white, TextAnchor.MiddleCenter);
+            Text name = CreateText("Name", labelPanel.transform, playerName, isSelf ? 15 : 13, Color.white, TextAnchor.MiddleCenter);
             name.fontStyle = FontStyle.Bold;
-            SetAnchors(name.rectTransform, 0f, 0.44f, 1f, 0.98f);
+            SetAnchors(name.rectTransform, 0f, 0.48f, 1f, 0.98f);
 
-            Text score = CreateText("Score", labelPanel.transform, "\u25ce " + scoreText, isSelf ? 18 : 17, yellow, TextAnchor.MiddleCenter);
+            Text score = CreateText("Score", labelPanel.transform, "\u25ce " + scoreText, isSelf ? 15 : 14, yellow, TextAnchor.MiddleCenter);
             score.fontStyle = FontStyle.Bold;
-            SetAnchors(score.rectTransform, 0f, 0.02f, 1f, 0.50f);
+            SetAnchors(score.rectTransform, 0f, 0.08f, 0.58f, 0.52f);
             playerScoreTexts.Add(score);
+
+            Text action = CreateText("Action", labelPanel.transform, string.Empty, 12, cream, TextAnchor.MiddleCenter);
+            SetAnchors(action.rectTransform, 0.50f, 0.06f, 1f, 0.52f);
+            playerActionTexts.Add(action);
 
             return root.transform;
         }
@@ -706,58 +1029,58 @@ namespace CardGame32
         private void CreateCuteAvatar(Transform parent, Color baseColor, bool isSelf, int styleIndex)
         {
             Image ring = CreateCircle("Avatar Gold Ring", parent, gold);
-            SetAnchors(ring.rectTransform, 0.20f, 0.36f, 0.80f, 1.00f);
-            AddUiShadow(ring, new Vector2(0f, -3f), 0.30f);
+            SetAnchors(ring.rectTransform, 0.22f, 0.38f, 0.78f, 1.00f);
+            AddUiShadow(ring, new Vector2(0f, -3f), 0.28f);
 
             Image baseCircle = CreateCircle("Avatar Base", parent, baseColor);
-            SetAnchors(baseCircle.rectTransform, 0.245f, 0.405f, 0.755f, 0.955f);
+            SetAnchors(baseCircle.rectTransform, 0.265f, 0.425f, 0.735f, 0.945f);
 
             Image face = CreateCircle("Face", parent, new Color(1.0f, 0.78f, 0.58f, 1f));
-            SetAnchors(face.rectTransform, 0.33f, 0.48f, 0.67f, 0.84f);
+            SetAnchors(face.rectTransform, 0.35f, 0.50f, 0.65f, 0.84f);
 
             Image hair = CreatePanel("Hair", parent, isSelf ? new Color(0.15f, 0.09f, 0.05f, 1f) : new Color(0.18f, 0.10f, 0.06f, 1f));
             hair.sprite = softRoundedSprite;
-            SetAnchors(hair.rectTransform, 0.31f, 0.73f, 0.69f, 0.90f);
+            SetAnchors(hair.rectTransform, 0.33f, 0.74f, 0.67f, 0.88f);
 
             Image leftEye = CreateCircle("Left Eye", parent, navy);
-            SetAnchors(leftEye.rectTransform, 0.405f, 0.63f, 0.445f, 0.67f);
+            SetAnchors(leftEye.rectTransform, 0.415f, 0.64f, 0.452f, 0.676f);
             Image rightEye = CreateCircle("Right Eye", parent, navy);
-            SetAnchors(rightEye.rectTransform, 0.555f, 0.63f, 0.595f, 0.67f);
+            SetAnchors(rightEye.rectTransform, 0.548f, 0.64f, 0.585f, 0.676f);
 
-            Image leftCheek = CreateCircle("Left Cheek", parent, new Color(1f, 0.35f, 0.36f, 0.42f));
-            SetAnchors(leftCheek.rectTransform, 0.36f, 0.55f, 0.43f, 0.61f);
-            Image rightCheek = CreateCircle("Right Cheek", parent, new Color(1f, 0.35f, 0.36f, 0.42f));
-            SetAnchors(rightCheek.rectTransform, 0.57f, 0.55f, 0.64f, 0.61f);
+            Image leftCheek = CreateCircle("Left Cheek", parent, new Color(1f, 0.35f, 0.36f, 0.38f));
+            SetAnchors(leftCheek.rectTransform, 0.37f, 0.56f, 0.43f, 0.61f);
+            Image rightCheek = CreateCircle("Right Cheek", parent, new Color(1f, 0.35f, 0.36f, 0.38f));
+            SetAnchors(rightCheek.rectTransform, 0.57f, 0.56f, 0.63f, 0.61f);
 
-            Text mouth = CreateText("Mouth", parent, "\u25e1", 20, navy, TextAnchor.MiddleCenter);
-            SetAnchors(mouth.rectTransform, 0.42f, 0.49f, 0.58f, 0.59f);
+            Text mouth = CreateText("Mouth", parent, "\u25e1", 17, navy, TextAnchor.MiddleCenter);
+            SetAnchors(mouth.rectTransform, 0.43f, 0.50f, 0.57f, 0.59f);
 
             if (styleIndex % 4 == 1)
             {
                 Image bowLeft = CreateCircle("Bow Left", parent, yellow);
-                SetAnchors(bowLeft.rectTransform, 0.30f, 0.81f, 0.40f, 0.91f);
+                SetAnchors(bowLeft.rectTransform, 0.31f, 0.80f, 0.40f, 0.90f);
                 Image bowRight = CreateCircle("Bow Right", parent, yellow);
-                SetAnchors(bowRight.rectTransform, 0.38f, 0.81f, 0.48f, 0.91f);
+                SetAnchors(bowRight.rectTransform, 0.38f, 0.80f, 0.47f, 0.90f);
             }
             else if (styleIndex % 4 == 2)
             {
                 Image cap = CreatePanel("Cap", parent, coral);
                 cap.sprite = softRoundedSprite;
-                SetAnchors(cap.rectTransform, 0.29f, 0.78f, 0.71f, 0.90f);
+                SetAnchors(cap.rectTransform, 0.31f, 0.78f, 0.69f, 0.89f);
             }
             else if (styleIndex % 4 == 3)
             {
-                Image glassesLeft = CreatePanel("Glasses Left", parent, new Color(0.03f, 0.04f, 0.05f, 0.90f));
-                SetAnchors(glassesLeft.rectTransform, 0.37f, 0.62f, 0.47f, 0.69f);
-                Image glassesRight = CreatePanel("Glasses Right", parent, new Color(0.03f, 0.04f, 0.05f, 0.90f));
-                SetAnchors(glassesRight.rectTransform, 0.53f, 0.62f, 0.63f, 0.69f);
+                Image glassesLeft = CreatePanel("Glasses Left", parent, new Color(0.03f, 0.04f, 0.05f, 0.88f));
+                SetAnchors(glassesLeft.rectTransform, 0.38f, 0.63f, 0.47f, 0.69f);
+                Image glassesRight = CreatePanel("Glasses Right", parent, new Color(0.03f, 0.04f, 0.05f, 0.88f));
+                SetAnchors(glassesRight.rectTransform, 0.53f, 0.63f, 0.62f, 0.69f);
             }
         }
 
         private void CreateStatusPanel()
         {
-            Image panel = CreateFramedPanel("Status Panel", hudRoot, new Color(0.07f, 0.07f, 0.09f, 0.88f), new Vector2(0.045f, 0.145f), new Vector2(0.955f, 0.205f), 3f);
-            statusText = CreateText("Status", panel.transform, "\u672c\u5730\u8bd5\u73a9\uff1a\u4e0b\u4e00\u6b65\u63a5\u5165\u670d\u52a1\u5668", 15, cream, TextAnchor.MiddleCenter);
+            Image panel = CreateFramedPanel("Status Panel", hudRoot, new Color(0.07f, 0.07f, 0.09f, 0.90f), new Vector2(0.045f, 0.145f), new Vector2(0.955f, 0.205f), 3f);
+            statusText = CreateText("Status", panel.transform, "\u7b49\u5f85\u53d1\u724c", 14, cream, TextAnchor.MiddleCenter);
             Stretch(statusText.rectTransform, 10f, 0f, -10f, 0f);
         }
 
@@ -768,13 +1091,16 @@ namespace CardGame32
             rail.sprite = softRoundedSprite;
             AddUiShadow(rail, new Vector2(0f, 4f), 0.30f);
 
-            CreateButton("Fold Button", rail.transform, "\u5f03\u724c\n\u2715", coral, new Vector2(0.04f, 0.16f), new Vector2(0.245f, 0.90f), Fold, false, 24);
-            CreateButton("Raise Button", rail.transform, "\u52a0\u6ce8\n\u2191", green, new Vector2(0.275f, 0.16f), new Vector2(0.48f, 0.90f), Raise, false, 24);
-            CreateButton("Knock Button", rail.transform, "\u6572\u684c\n\u25ce", blue, new Vector2(0.51f, 0.16f), new Vector2(0.715f, 0.90f), Knock, false, 24);
+            actionHintText = CreateText("Action Hint", rail.transform, "\u8f6e\u5230\u4f60\u4e86", 13, cream, TextAnchor.MiddleCenter);
+            SetAnchors(actionHintText.rectTransform, 0.03f, 0.70f, 0.52f, 0.98f);
 
-            Button driveButton = CreateButton("Drive Button", rail.transform, "\u5f00\u8f66\n2s", yellow, new Vector2(0.765f, 0.02f), new Vector2(0.985f, 0.98f), Drive, true, 27);
-            driveButtonText = driveButton.GetComponentInChildren<Text>();
-            driveGlow = driveButton.GetComponent<Image>();
+            actionTimerText = CreateText("Action Timer", rail.transform, "10s", 18, yellow, TextAnchor.MiddleCenter);
+            actionTimerText.fontStyle = FontStyle.Bold;
+            SetAnchors(actionTimerText.rectTransform, 0.53f, 0.70f, 0.72f, 0.98f);
+
+            foldButton = CreateButton("Fold Button", rail.transform, "\u5f03\u724c", coral, new Vector2(0.04f, 0.13f), new Vector2(0.28f, 0.70f), Fold, false, 24);
+            raiseButton = CreateButton("Raise Button", rail.transform, "\u52a0\u6ce8", green, new Vector2(0.38f, 0.13f), new Vector2(0.62f, 0.70f), Raise, false, 24);
+            knockButton = CreateButton("Knock Button", rail.transform, "\u6572\u684c", blue, new Vector2(0.72f, 0.13f), new Vector2(0.96f, 0.70f), Knock, false, 24);
         }
 
         private Button CreateButton(string objectName, Transform parent, string label, Color color, Vector2 anchorMin, Vector2 anchorMax, UnityEngine.Events.UnityAction action, bool round, int fontSize)
@@ -803,23 +1129,29 @@ namespace CardGame32
 
         private void RenderHands()
         {
+            ClearDealtObjects();
             Vector2[] anchors =
             {
-                new Vector2(0.50f, 0.332f),
-                new Vector2(0.16f, 0.505f),
-                new Vector2(0.50f, 0.650f),
-                new Vector2(0.84f, 0.505f),
-                new Vector2(0.78f, 0.285f),
-                new Vector2(0.22f, 0.285f),
-                new Vector2(0.31f, 0.630f),
-                new Vector2(0.69f, 0.630f)
+                new Vector2(0.50f, 0.333f),
+                new Vector2(0.165f, 0.500f),
+                new Vector2(0.50f, 0.635f),
+                new Vector2(0.835f, 0.500f),
+                new Vector2(0.770f, 0.290f),
+                new Vector2(0.230f, 0.290f),
+                new Vector2(0.315f, 0.620f),
+                new Vector2(0.685f, 0.620f)
             };
 
             for (int i = 0; i < players.Count; i++)
             {
-                bool reveal = i == 0;
-                Vector2 size = reveal ? new Vector2(58f, 82f) : new Vector2(43f, 60f);
-                float spacing = reveal ? 34f : 24f;
+                if (players[i].Folded)
+                {
+                    continue;
+                }
+
+                bool reveal = i == LocalPlayerIndex || players[i].Revealed;
+                Vector2 size = reveal ? new Vector2(56f, 80f) : new Vector2(39f, 55f);
+                float spacing = reveal ? 32f : 22f;
 
                 for (int c = 0; c < players[i].Cards.Count; c++)
                 {
@@ -835,7 +1167,7 @@ namespace CardGame32
             GameObject deckObject = CreateCard(default(CardDefinition), false);
             deckObject.name = "Deck Pile";
             deckObject.transform.SetParent(cardRoot, false);
-            SetRect((RectTransform)deckObject.transform, new Vector2(0.5f, 0.410f), new Vector2(64f, 86f), Vector2.zero);
+            SetRect((RectTransform)deckObject.transform, new Vector2(0.5f, 0.410f), new Vector2(58f, 78f), Vector2.zero);
             dealtObjects.Add(deckObject);
         }
 
@@ -855,8 +1187,8 @@ namespace CardGame32
             if (!reveal)
             {
                 Image markCircle = CreateCircle("Back Medallion", face.transform, new Color(1f, 1f, 1f, 0.22f));
-                SetRect(markCircle.rectTransform, new Vector2(0.5f, 0.5f), new Vector2(30f, 30f), Vector2.zero);
-                Text backMark = CreateText("Back Mark", face.transform, "\u2663", 24, cream, TextAnchor.MiddleCenter);
+                SetRect(markCircle.rectTransform, new Vector2(0.5f, 0.5f), new Vector2(28f, 28f), Vector2.zero);
+                Text backMark = CreateText("Back Mark", face.transform, "\u2663", 22, cream, TextAnchor.MiddleCenter);
                 backMark.fontStyle = FontStyle.Bold;
                 Stretch(backMark.rectTransform, 0f, 0f, 0f, 0f);
                 return cardObject;
@@ -866,11 +1198,11 @@ namespace CardGame32
             string rank = RankLabel(card.Rank);
             Color textColor = card.Color == CardColor.Red ? coral : navy;
 
-            Text rankText = CreateText("Rank", face.transform, rank, 22, textColor, TextAnchor.UpperLeft);
+            Text rankText = CreateText("Rank", face.transform, rank, 21, textColor, TextAnchor.UpperLeft);
             rankText.fontStyle = FontStyle.Bold;
             Stretch(rankText.rectTransform, 6f, 5f, -6f, -5f);
 
-            Text suitText = CreateText("Suit", face.transform, suit, 30, textColor, TextAnchor.MiddleCenter);
+            Text suitText = CreateText("Suit", face.transform, suit, 29, textColor, TextAnchor.MiddleCenter);
             suitText.fontStyle = FontStyle.Bold;
             Stretch(suitText.rectTransform, 0f, 6f, 0f, -18f);
 
@@ -927,7 +1259,7 @@ namespace CardGame32
             }
         }
 
-        private void RefreshUi(string status)
+        private void RefreshUi()
         {
             if (potText != null)
             {
@@ -942,16 +1274,67 @@ namespace CardGame32
 
             if (statusText != null)
             {
-                string hand = players.Count > 0 && players[0].Cards.Count >= 2
-                    ? CardGameRules.DescribeHand(players[0].Cards[0], players[0].Cards[1])
-                    : "\u7b49\u5f85\u53d1\u724c";
-                statusText.text = status + " | " + hand;
+                string hand = "\u7b49\u5f85\u53d1\u724c";
+                if (players.Count > 0 && players[LocalPlayerIndex].Cards.Count >= 2)
+                {
+                    hand = players[LocalPlayerIndex].Folded
+                        ? "\u4f60\u5df2\u5f03\u724c"
+                        : CardGameRules.DescribeHand(players[LocalPlayerIndex].Cards[0], players[LocalPlayerIndex].Cards[1]);
+                }
+
+                statusText.text = statusMessage + " | " + hand;
             }
 
             for (int i = 0; i < playerScoreTexts.Count && i < players.Count; i++)
             {
                 playerScoreTexts[i].text = "\u25ce " + players[i].Score.ToString("N0");
             }
+
+            for (int i = 0; i < playerActionTexts.Count && i < players.Count; i++)
+            {
+                playerActionTexts[i].text = players[i].LastAction;
+            }
+
+            for (int i = 0; i < playerTurnRings.Count; i++)
+            {
+                Color color = gold;
+                color.a = i == currentTurnIndex && (phase == RoundPhase.Betting || phase == RoundPhase.Challenge) ? 0.55f : 0f;
+                playerTurnRings[i].color = color;
+            }
+        }
+
+        private void UpdateActionControls()
+        {
+            bool localCanAct = CanLocalAct();
+            if (actionRoot != null)
+            {
+                actionRoot.gameObject.SetActive(localCanAct);
+            }
+
+            if (!localCanAct)
+            {
+                RefreshUi();
+                return;
+            }
+
+            if (actionTimerText != null)
+            {
+                actionTimerText.text = Mathf.CeilToInt(turnTimeRemaining).ToString() + "s";
+            }
+
+            if (actionHintText != null)
+            {
+                actionHintText.text = phase == RoundPhase.Betting
+                    ? "\u8f6e\u5230\u4f60\u4e86\uff0c10\u79d2\u5185\u9009\u62e9"
+                    : "\u5bf9\u624b\u6572\u684c\uff0c\u53ef\u6572\u684c\u6216\u5f03\u724c";
+            }
+
+            if (raiseButton != null)
+            {
+                raiseButton.gameObject.SetActive(phase == RoundPhase.Betting);
+            }
+
+            RefreshUi();
         }
 
         private void UpdateChatPreview()
@@ -1081,6 +1464,9 @@ namespace CardGame32
             public string Name;
             public int Score;
             public bool Folded;
+            public bool Revealed;
+            public bool HasActed;
+            public string LastAction = string.Empty;
             public readonly List<CardDefinition> Cards = new List<CardDefinition>();
         }
     }
