@@ -43,3 +43,18 @@ Desktop.ini
 sysinfo.txt
 crashlytics-build.properties
 ~UnityDirMonSyncFile~*
+
+# Unused Unity template leftovers in this workspace
+Assets/DefaultVolumeProfile.asset
+Assets/DefaultVolumeProfile.asset.meta
+Assets/DisabledXrTemplateAssets~/
+Assets/Resources/PerformanceTestRun*.json
+Assets/Resources/PerformanceTestRun*.json.meta
+Assets/Scenes/
+Assets/Scenes.meta
+Assets/Settings/
+Assets/Settings.meta
+Assets/TextMesh Pro/
+Assets/TextMesh Pro.meta
+ProjectSettings/Packages/
+VivoxCompile.log
