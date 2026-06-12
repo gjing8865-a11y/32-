@@ -1,0 +1,45 @@
+# Unity generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.csproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.unityproj
+*.opendb
+*.VC.db
+
+# Unity generated/binary outputs
+*.apk
+*.aab
+*.app
+*.unitypackage
+*.tmp
+*.pdb
+*.mdb
+*.pdb.meta
+*.mdb.meta
+
+# Version control and local platform clutter
+.plastic/
+*.private
+*.private.meta
+.DS_Store
+Thumbs.db
+Desktop.ini
+sysinfo.txt
+crashlytics-build.properties
+~UnityDirMonSyncFile~*
